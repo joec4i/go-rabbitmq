@@ -2,6 +2,7 @@ package rabbitmq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -403,5 +404,213 @@ func TestConnCloseDuringReconnectStaysClosed(t *testing.T) {
 			t.Fatal("closed connection reconnected to the restarted broker")
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// TestPublishWithOutcomeExactFailedSet pipelines a large mixed batch of
+// routable and unroutable mandatory messages and asserts the failed set is
+// reconstructed exactly, with each returned message paired with its own
+// return (verified by body), regardless of confirmation interleaving.
+func TestPublishWithOutcomeExactFailedSet(t *testing.T) {
+	const messageCount = 400
+
+	connStr := prepareDockerTest(t)
+	conn := waitForHealthyAmqp(t, connStr)
+	defer conn.Close()
+
+	queueName := "outcome_queue"
+	consumer, err := NewConsumer(conn, queueName, WithConsumerOptionsLogger(simpleLogF(t.Logf)))
+	if err != nil {
+		t.Fatal("error creating consumer", err)
+	}
+	defer consumer.CloseWithContext(context.Background())
+	go func() {
+		_ = consumer.Run(func(d Delivery) Action { return Ack })
+	}()
+
+	publisher, err := NewPublisher(conn,
+		WithPublisherOptionsLogger(simpleLogF(t.Logf)),
+		WithPublisherOptionsConfirm,
+		WithPublisherOptionsMaxOutcomesInFlight(64),
+	)
+	if err != nil {
+		t.Fatal("error creating publisher", err)
+	}
+	defer publisher.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	var outcomes []*PublishOutcome
+	var wantFailed []bool
+	for i := range messageCount {
+		unroutable := i%5 == 0
+		routingKey := queueName
+		if unroutable {
+			routingKey = "no-such-queue"
+		}
+		body := []byte(fmt.Sprintf("message-%d", i))
+		batch, err := publisher.PublishWithOutcome(ctx, body, []string{routingKey}, WithPublishOptionsMandatory)
+		if err != nil {
+			t.Fatalf("publish %d failed: %v", i, err)
+		}
+		outcomes = append(outcomes, batch...)
+		wantFailed = append(wantFailed, unroutable)
+	}
+
+	for i, po := range outcomes {
+		outcome, err := po.Wait(ctx)
+		if err != nil {
+			t.Fatalf("message %d: timed out waiting for outcome: %v", i, err)
+		}
+		if outcome.Err != nil {
+			t.Fatalf("message %d: unexpected outcome error: %v", i, outcome.Err)
+		}
+		if outcome.Failed() != wantFailed[i] {
+			t.Fatalf("message %d: Failed() = %v, want %v (outcome %+v)", i, outcome.Failed(), wantFailed[i], outcome)
+		}
+		if wantFailed[i] {
+			if !outcome.Ack || outcome.Return == nil {
+				t.Fatalf("message %d: unroutable message should be acked with a return, got %+v", i, outcome)
+			}
+			if got, want := string(outcome.Return.Body), fmt.Sprintf("message-%d", i); got != want {
+				t.Fatalf("message %d: return mis-paired, body %q, want %q", i, got, want)
+			}
+		}
+	}
+}
+
+// TestPublishWithOutcomeNonMandatory documents that without the Mandatory
+// option the broker silently drops unroutable messages and still confirms
+// them, so the outcome cannot detect the routing failure.
+func TestPublishWithOutcomeNonMandatory(t *testing.T) {
+	connStr := prepareDockerTest(t)
+	conn := waitForHealthyAmqp(t, connStr)
+	defer conn.Close()
+
+	publisher, err := NewPublisher(conn,
+		WithPublisherOptionsLogger(simpleLogF(t.Logf)),
+		WithPublisherOptionsConfirm,
+	)
+	if err != nil {
+		t.Fatal("error creating publisher", err)
+	}
+	defer publisher.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	batch, err := publisher.PublishWithOutcome(ctx, []byte("dropped"), []string{"no-such-queue"})
+	if err != nil {
+		t.Fatal("publish failed", err)
+	}
+	outcome, err := batch[0].Wait(ctx)
+	if err != nil {
+		t.Fatal("timed out waiting for outcome", err)
+	}
+	if outcome.Failed() || !outcome.Ack || outcome.Return != nil {
+		t.Fatalf("non-mandatory unroutable message should be a clean ack, got %+v", outcome)
+	}
+}
+
+// TestPublishWithOutcomeChannelReconnect forces a channel-level reconnect
+// with a batch in flight: every outcome must still resolve (as an ack or as
+// ErrOutcomeUnknown, never hang), and after the reconnect both confirmations
+// and returns must keep flowing on the replacement channel.
+func TestPublishWithOutcomeChannelReconnect(t *testing.T) {
+	const messageCount = 100
+
+	connStr := prepareDockerTest(t)
+	conn := waitForHealthyAmqp(t, connStr, WithConnectionOptionsBaseReconnectInterval(10*time.Millisecond))
+	defer conn.Close()
+
+	queueName := "outcome_reconnect_queue"
+	consumer, err := NewConsumer(conn, queueName, WithConsumerOptionsLogger(simpleLogF(t.Logf)))
+	if err != nil {
+		t.Fatal("error creating consumer", err)
+	}
+	defer consumer.CloseWithContext(context.Background())
+	go func() {
+		_ = consumer.Run(func(d Delivery) Action { return Ack })
+	}()
+
+	publisher, err := NewPublisher(conn,
+		WithPublisherOptionsLogger(simpleLogF(t.Logf)),
+		WithPublisherOptionsConfirm,
+	)
+	if err != nil {
+		t.Fatal("error creating publisher", err)
+	}
+	defer publisher.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	var outcomes []*PublishOutcome
+	for i := range messageCount {
+		batch, err := publisher.PublishWithOutcome(ctx, []byte("in-flight"), []string{queueName}, WithPublishOptionsMandatory)
+		if err != nil {
+			t.Fatalf("publish %d failed: %v", i, err)
+		}
+		outcomes = append(outcomes, batch...)
+	}
+
+	// force a channel-level close while confirmations are in flight
+	reconnectionCount := publisher.chanManager.GetReconnectionCount()
+	_ = publisher.Publish([]byte("boom"), []string{"unused"}, WithPublishOptionsExchange("missing-exchange"))
+	deadline := time.Now().Add(10 * time.Second)
+	for publisher.chanManager.GetReconnectionCount() == reconnectionCount {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for channel reconnect")
+		}
+		runtime.Gosched()
+	}
+
+	unknown := 0
+	for i, po := range outcomes {
+		outcome, err := po.Wait(ctx)
+		if err != nil {
+			t.Fatalf("message %d: outcome hung across reconnect: %v", i, err)
+		}
+		switch {
+		case outcome.Err != nil:
+			if !errors.Is(outcome.Err, ErrOutcomeUnknown) {
+				t.Fatalf("message %d: unexpected error %v", i, outcome.Err)
+			}
+			unknown++
+		case outcome.Ack && outcome.Return == nil:
+			// confirmed before the channel died
+		default:
+			t.Fatalf("message %d: unexpected outcome %+v", i, outcome)
+		}
+	}
+	t.Logf("%d of %d in-flight outcomes resolved as unknown across the reconnect", unknown, messageCount)
+
+	// publishing gates on the returns listener covering the new channel, so
+	// the very first post-reconnect unroutable publish must resolve with its
+	// return; a clean ack here would be a silently false success
+	batch, err := publisher.PublishWithOutcome(ctx, []byte("post-reconnect"), []string{"no-such-queue"}, WithPublishOptionsMandatory)
+	if err != nil {
+		t.Fatalf("publish after reconnect failed: %v", err)
+	}
+	outcome, err := batch[0].Wait(ctx)
+	if err != nil {
+		t.Fatal("timed out waiting for post-reconnect outcome", err)
+	}
+	if !outcome.Ack || outcome.Return == nil || outcome.Err != nil {
+		t.Fatalf("post-reconnect unroutable message must carry its return, got %+v", outcome)
+	}
+
+	// and routable messages must confirm cleanly
+	batch, err = publisher.PublishWithOutcome(ctx, []byte("routable"), []string{queueName}, WithPublishOptionsMandatory)
+	if err != nil {
+		t.Fatal("routable publish after reconnect failed", err)
+	}
+	outcome, err = batch[0].Wait(ctx)
+	if err != nil {
+		t.Fatal("timed out waiting for routable outcome", err)
+	}
+	if outcome.Failed() {
+		t.Fatalf("routable message after reconnect should succeed, got %+v", outcome)
 	}
 }
