@@ -99,6 +99,42 @@ if err != nil {
 }
 ```
 
+## Reliable publishing with per-message outcomes
+
+To know the fate of each published message — confirmed, nacked, or returned as
+unroutable — use `PublishWithOutcome` on a publisher created with
+`WithPublisherOptionsConfirm`. Unlike consuming `NotifyPublish` and
+`NotifyReturn` as separate streams, it pairs each message's confirmation with
+its return reliably, even with many messages in flight, so you can republish
+exactly the failed subset of a batch:
+
+```go
+outcomes, err := publisher.PublishWithOutcome(
+	ctx,
+	[]byte("hello, world"),
+	[]string{"my_routing_key"},
+	rabbitmq.WithPublishOptionsExchange("events"),
+	rabbitmq.WithPublishOptionsMandatory, // required to detect unroutable messages
+)
+if err != nil {
+	log.Println(err)
+}
+for _, po := range outcomes {
+	outcome, err := po.Wait(ctx)
+	if err != nil {
+		log.Println(err)
+	} else if outcome.Failed() {
+		// nacked, returned as unroutable, or unknown (channel lost mid-flight):
+		// republish, but see ErrOutcomeUnknown about possible duplicates
+	}
+}
+```
+
+Use `WithPublisherOptionsMaxOutcomesInFlight` to bound memory by limiting how
+many outcomes may be unresolved at once. See
+[examples/publisher_outcome](examples/publisher_outcome) for a complete batch
+publish-and-retry example.
+
 ## Other usage examples
 
 See the [examples](examples) directory for more ideas.

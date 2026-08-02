@@ -15,6 +15,13 @@ import (
 // outcomeChannelManager is the subset of the channel manager the outcome
 // tracker relies on, extracted so the reconnect behavior can be tested
 // without a broker.
+//
+// Contract: GetReconnectionCount advances together with the channel swap,
+// while the channel lock is still held, so any operation that can reach the
+// new channel also observes the new count. The tracker's listener gate and
+// post-publish verification are unsound without this coupling — a publish
+// could land on a freshly swapped channel (with no returns listener yet)
+// while the count still reports the generation the listener covers.
 type outcomeChannelManager interface {
 	GetReconnectionCount() uint
 	NotifyReturnSafe(c chan amqp.Return) chan amqp.Return
@@ -36,7 +43,7 @@ const OutcomeIDHeader = "x-gorabbitmq-outcome-id"
 // races with a channel loss may occasionally be reported as unknown, but the
 // reverse never happens — an outcome reported as a definite ack or nack was
 // really sent by the broker on a live channel.
-var ErrOutcomeUnknown = errors.New("outcome unknown: channel closed before the broker confirmed the publishing")
+var ErrOutcomeUnknown = errors.New("outcome unknown: the channel was lost or replaced while the publishing was in flight")
 
 // ErrPublisherClosed reports that the publisher was closed before the
 // operation could complete.
@@ -209,12 +216,11 @@ func (t *outcomeTracker) start() {
 
 // registerReturnsListener installs a returns listener on the current channel
 // and records which reconnection generation it covers. The registration is
-// sandwiched between two reads of the reconnection count: when they agree,
-// the listener is installed on a channel no older than that generation (the
-// count advances only after a swap completes, so the listener can be on a
-// newer channel than recorded — which only makes the gate over-conservative,
-// never wrong). When the reads differ, it is unknown which channel the
-// listener landed on; it cannot simply be dropped, because the amqp client
+// sandwiched between two reads of the reconnection count: the count advances
+// atomically with the channel swap, so when the reads agree the listener is
+// installed on exactly that generation's channel — the count cannot lag a
+// swap the registration observed. When the reads differ, it is unknown which
+// channel the listener landed on; it cannot simply be dropped, because the amqp client
 // has no listener deregistration and an unconsumed listener on the live
 // channel would eventually fill and block the connection's frame dispatch.
 // It is drained and discarded instead: discarding is safe because publishes
@@ -287,10 +293,10 @@ func (t *outcomeTracker) run(returns <-chan amqp.Return, reconnCh <-chan error, 
 
 	for {
 		// wait for a reconnect signal while there is no live returns
-		// listener, or while the listener is stale — a registration that
-		// landed after a channel swap but before the reconnection count
-		// advanced records too old a generation, keeping the publish gate
-		// closed until re-registration
+		// listener, or while the listener is stale — a reconnect completed
+		// after the registration, so the pending signal should trigger
+		// re-registration promptly rather than waiting for the superseded
+		// listener's channel close to propagate
 		var reconn <-chan error
 		if (returns == nil || t.listenerStale()) && !doneSeen {
 			reconn = reconnCh
@@ -522,7 +528,10 @@ func (publisher *Publisher) PublishWithOutcome(
 
 		// if a reconnect landed between the listener check and the publish,
 		// the message may have gone out on a channel the listener doesn't
-		// cover; resolve it conservatively rather than risk a false success
+		// cover; resolve it conservatively rather than risk a false success.
+		// This check is sound because the count advances before a swapped-in
+		// channel becomes publishable: a publish that reached a newer channel
+		// than the listener's is always visible as a count mismatch here
 		uncertain := tracker.chanManager.GetReconnectionCount() != listenerGen
 
 		po := &PublishOutcome{done: make(chan struct{})}
