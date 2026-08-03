@@ -284,6 +284,46 @@ func assertIdentity(t *testing.T, outcome Outcome, id string) {
 	}
 }
 
+// TestOutcomeWaitTimeoutKeepsIdentity: giving up on an unresolved outcome is
+// exactly when a caller needs to know which message it gave up on, so the
+// timeout path returns the identity rather than a zero Outcome. The context
+// error must not be written into the outcome itself: a later Wait still has to
+// report the message's real fate.
+func TestOutcomeWaitTimeoutKeepsIdentity(t *testing.T) {
+	tracker, _, stop := newTestTracker(t, 0)
+	defer stop()
+
+	id := t.Name()
+	dc := &fakeDC{ack: true, done: make(chan struct{})}
+	po := submit(tracker, id, dc)
+
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	outcome, err := po.Wait(expired)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if !errors.Is(outcome.Err, context.Canceled) {
+		t.Errorf("outcome.Err = %v, want context.Canceled", outcome.Err)
+	}
+	if !outcome.Failed() {
+		t.Error("an outcome still in flight must report Failed()")
+	}
+	if outcome.Ack || outcome.Return != nil {
+		t.Errorf("timeout must not report a fate, got %+v", outcome)
+	}
+	assertIdentity(t, outcome, id)
+
+	// the real outcome is unaffected by having been waited on and abandoned
+	close(dc.done)
+	resolved := waitOutcome(t, po)
+	if !resolved.Ack || resolved.Err != nil {
+		t.Fatalf("resolved outcome = %+v, want acked with no error", resolved)
+	}
+	assertIdentity(t, resolved, id)
+}
+
 // TestOutcomeRefReadableWhileUnresolved is the executable form of the
 // disjointness argument: the ref is written before the tracker goroutine
 // starts and the tracker never touches it, so reading it concurrently with
@@ -329,6 +369,7 @@ func TestOutcomeFailed(t *testing.T) {
 		{"nacked", Outcome{Ack: false}, true},
 		{"acked but returned", Outcome{Ack: true, Return: ret}, true},
 		{"unknown", Outcome{Err: ErrOutcomeUnknown}, true},
+		{"still in flight", Outcome{Err: context.DeadlineExceeded}, true},
 	} {
 		if got := test.outcome.Failed(); got != test.failed {
 			t.Errorf("%s: Failed() = %v, want %v", test.name, got, test.failed)

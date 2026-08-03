@@ -133,12 +133,38 @@ func (p *PublishOutcome) Ref() any {
 }
 
 // Wait blocks until the outcome is available or the context is done.
+//
+// On context expiry the returned Outcome still carries the message identity,
+// with Err set to the context error, so the message can be identified without
+// any caller-side bookkeeping. The message is genuinely still in flight in that
+// case: like ErrOutcomeUnknown it may yet be delivered, so only republish it if
+// consumers tolerate duplicates. Distinguish the two with errors.Is. The
+// outcome keeps resolving in the background, and Done and a later Wait still
+// report its true fate.
 func (p *PublishOutcome) Wait(ctx context.Context) (Outcome, error) {
 	select {
 	case <-p.done:
 		return p.outcome, nil
 	case <-ctx.Done():
-		return Outcome{}, ctx.Err()
+		// the context error goes on the returned copy only, never into
+		// p.outcome, so a later Wait still sees the real outcome
+		pending := p.identity()
+		pending.Err = ctx.Err()
+		return pending, ctx.Err()
+	}
+}
+
+// identity is the half of the outcome that is safe to read before it resolves:
+// these fields are written by PublishWithOutcome before the tracker goroutine
+// starts and the tracker never writes them, so reading them does not race with
+// a concurrent resolution. Do not widen this to Ack, Return or Err.
+func (p *PublishOutcome) identity() Outcome {
+	return Outcome{
+		ID:          p.outcome.ID,
+		Exchange:    p.outcome.Exchange,
+		RoutingKey:  p.outcome.RoutingKey,
+		DeliveryTag: p.outcome.DeliveryTag,
+		Ref:         p.outcome.Ref,
 	}
 }
 
