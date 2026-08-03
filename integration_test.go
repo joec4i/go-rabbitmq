@@ -411,6 +411,36 @@ func TestConnCloseDuringReconnectStaysClosed(t *testing.T) {
 // routable and unroutable mandatory messages and asserts the failed set is
 // reconstructed exactly, with each returned message paired with its own
 // return (verified by body), regardless of confirmation interleaving.
+// probeBody is the payload waitForRoutable publishes. Handlers in these tests
+// skip it so it does not count towards delivery assertions.
+const probeBody = "routability-probe"
+
+// waitForRoutable blocks until a mandatory publish to exchange/routingKey is no
+// longer returned as unroutable. A consumer declares its queue and bindings
+// inside Run, which the tests start in a goroutine, so without this the first
+// messages of a batch can be genuinely unroutable and the failed set is larger
+// than the test intends.
+func waitForRoutable(ctx context.Context, t *testing.T, publisher *Publisher, exchange, routingKey string) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		batch, err := publisher.PublishWithOutcome(ctx, []byte(probeBody), []string{routingKey},
+			WithPublishOptionsExchange(exchange),
+			WithPublishOptionsMandatory,
+		)
+		if err == nil && len(batch) == 1 {
+			outcome, waitErr := batch[0].Wait(ctx)
+			if waitErr == nil && !outcome.Failed() {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("routing key %q on exchange %q never became routable", routingKey, exchange)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 func TestPublishWithOutcomeExactFailedSet(t *testing.T) {
 	const messageCount = 400
 
@@ -441,42 +471,231 @@ func TestPublishWithOutcomeExactFailedSet(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	waitForRoutable(ctx, t, publisher, "", queueName)
+
+	// the ref carries what the assertions need, so the test keeps no parallel
+	// index from outcomes back to messages
+	type sent struct {
+		index      int
+		body       []byte
+		unroutable bool
+	}
+
 	var outcomes []*PublishOutcome
-	var wantFailed []bool
 	for i := range messageCount {
-		unroutable := i%5 == 0
+		msg := &sent{
+			index:      i,
+			body:       []byte(fmt.Sprintf("message-%d", i)),
+			unroutable: i%5 == 0,
+		}
 		routingKey := queueName
-		if unroutable {
+		if msg.unroutable {
 			routingKey = "no-such-queue"
 		}
-		body := []byte(fmt.Sprintf("message-%d", i))
-		batch, err := publisher.PublishWithOutcome(ctx, body, []string{routingKey}, WithPublishOptionsMandatory)
+		batch, err := publisher.PublishWithOutcome(ctx, msg.body, []string{routingKey},
+			WithPublishOptionsMandatory,
+			WithPublishOptionsOutcomeRef(msg),
+		)
 		if err != nil {
 			t.Fatalf("publish %d failed: %v", i, err)
 		}
 		outcomes = append(outcomes, batch...)
-		wantFailed = append(wantFailed, unroutable)
 	}
 
-	for i, po := range outcomes {
+	seenIDs := make(map[string]int, messageCount)
+	for _, po := range outcomes {
 		outcome, err := po.Wait(ctx)
 		if err != nil {
-			t.Fatalf("message %d: timed out waiting for outcome: %v", i, err)
+			t.Fatalf("timed out waiting for outcome %s: %v", outcome.ID, err)
+		}
+		msg, ok := outcome.Ref.(*sent)
+		if !ok {
+			t.Fatalf("outcome %+v did not carry its ref", outcome)
 		}
 		if outcome.Err != nil {
-			t.Fatalf("message %d: unexpected outcome error: %v", i, outcome.Err)
+			t.Fatalf("message %d: unexpected outcome error: %v", msg.index, outcome.Err)
 		}
-		if outcome.Failed() != wantFailed[i] {
-			t.Fatalf("message %d: Failed() = %v, want %v (outcome %+v)", i, outcome.Failed(), wantFailed[i], outcome)
+		if outcome.Failed() != msg.unroutable {
+			t.Fatalf("message %d: Failed() = %v, want %v (outcome %+v)", msg.index, outcome.Failed(), msg.unroutable, outcome)
 		}
-		if wantFailed[i] {
+		if outcome.ID == "" {
+			t.Fatalf("message %d: outcome carries no ID", msg.index)
+		}
+		if prev, dup := seenIDs[outcome.ID]; dup {
+			t.Fatalf("outcome ID %q reused by messages %d and %d", outcome.ID, prev, msg.index)
+		}
+		seenIDs[outcome.ID] = msg.index
+		// published to the default exchange
+		if outcome.Exchange != "" {
+			t.Fatalf("message %d: Exchange = %q, want the default exchange", msg.index, outcome.Exchange)
+		}
+		if msg.unroutable {
 			if !outcome.Ack || outcome.Return == nil {
-				t.Fatalf("message %d: unroutable message should be acked with a return, got %+v", i, outcome)
+				t.Fatalf("message %d: unroutable message should be acked with a return, got %+v", msg.index, outcome)
 			}
-			if got, want := string(outcome.Return.Body), fmt.Sprintf("message-%d", i); got != want {
-				t.Fatalf("message %d: return mis-paired, body %q, want %q", i, got, want)
+			if got, want := string(outcome.Return.Body), string(msg.body); got != want {
+				t.Fatalf("message %d: return mis-paired, body %q, want %q", msg.index, got, want)
 			}
 		}
+	}
+	if len(seenIDs) != messageCount {
+		t.Fatalf("resolved %d outcomes, want %d", len(seenIDs), messageCount)
+	}
+}
+
+// TestPublishWithOutcomeRepublishFailedSet is the acceptance test for acting on
+// the failed set: the failed outcomes are collected as plain Outcome values,
+// detached from the futures that produced them, and are still enough to
+// republish every message. Note that the test keeps no map from outcomes back
+// to messages - that is the point.
+func TestPublishWithOutcomeRepublishFailedSet(t *testing.T) {
+	const (
+		messageCount = 120
+		exchangeName = "outcome_retry_exchange"
+	)
+
+	connStr := prepareDockerTest(t)
+	conn := waitForHealthyAmqp(t, connStr)
+	defer conn.Close()
+
+	queueName := "outcome_retry_queue"
+
+	var mu sync.Mutex
+	delivered := map[string]int{}
+	consumer, err := NewConsumer(conn, queueName,
+		WithConsumerOptionsLogger(simpleLogF(t.Logf)),
+		WithConsumerOptionsExchangeName(exchangeName),
+		WithConsumerOptionsExchangeDeclare,
+		WithConsumerOptionsRoutingKey(queueName),
+	)
+	if err != nil {
+		t.Fatal("error creating consumer", err)
+	}
+	defer consumer.CloseWithContext(context.Background())
+	go func() {
+		_ = consumer.Run(func(d Delivery) Action {
+			if string(d.Body) != probeBody {
+				mu.Lock()
+				delivered[string(d.Body)]++
+				mu.Unlock()
+			}
+			return Ack
+		})
+	}()
+
+	publisher, err := NewPublisher(conn,
+		WithPublisherOptionsLogger(simpleLogF(t.Logf)),
+		WithPublisherOptionsConfirm,
+		WithPublisherOptionsExchangeName(exchangeName),
+		WithPublisherOptionsExchangeDeclare,
+		WithPublisherOptionsMaxOutcomesInFlight(32),
+	)
+	if err != nil {
+		t.Fatal("error creating publisher", err)
+	}
+	defer publisher.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	waitForRoutable(ctx, t, publisher, exchangeName, queueName)
+
+	// half the batch is aimed at a routing key nothing is bound to
+	wantRetried := map[string]bool{}
+	wantRouted := map[string]bool{}
+	var outcomes []*PublishOutcome
+	for i := range messageCount {
+		body := fmt.Sprintf("routed-%d", i)
+		routingKey := queueName
+		if i%2 == 0 {
+			body = fmt.Sprintf("unrouted-%d", i)
+			routingKey = "no-such-binding"
+			wantRetried[body] = true
+		} else {
+			wantRouted[body] = true
+		}
+		batch, err := publisher.PublishWithOutcome(ctx, []byte(body), []string{routingKey},
+			WithPublishOptionsExchange(exchangeName),
+			WithPublishOptionsMandatory,
+			WithPublishOptionsOutcomeRef([]byte(body)),
+		)
+		if err != nil {
+			t.Fatalf("publish %d failed: %v", i, err)
+		}
+		outcomes = append(outcomes, batch...)
+	}
+
+	var failed []Outcome
+	for _, po := range outcomes {
+		outcome, err := po.Wait(ctx)
+		if err != nil {
+			t.Fatalf("timed out waiting for outcome %s: %v", outcome.ID, err)
+		}
+		if outcome.Failed() {
+			failed = append(failed, outcome)
+		}
+	}
+	if len(failed) != len(wantRetried) {
+		t.Fatalf("failed set has %d outcomes, want %d", len(failed), len(wantRetried))
+	}
+
+	// republish from the outcomes alone: Exchange says where the message
+	// belonged and Ref carries the payload back
+	var retries []*PublishOutcome
+	for _, outcome := range failed {
+		body, ok := outcome.Ref.([]byte)
+		if !ok {
+			t.Fatalf("failed outcome %+v did not carry its ref", outcome)
+		}
+		if !wantRetried[string(body)] {
+			t.Fatalf("unexpected message in the failed set: %q", body)
+		}
+		batch, err := publisher.PublishWithOutcome(ctx, body, []string{queueName},
+			WithPublishOptionsExchange(outcome.Exchange),
+			WithPublishOptionsMandatory,
+		)
+		if err != nil {
+			t.Fatalf("republish of %q failed: %v", body, err)
+		}
+		retries = append(retries, batch...)
+	}
+
+	for _, po := range retries {
+		outcome, err := po.Wait(ctx)
+		if err != nil {
+			t.Fatalf("timed out waiting for retry outcome %s: %v", outcome.ID, err)
+		}
+		if outcome.Failed() {
+			t.Fatalf("republished message still failed: %+v", outcome)
+		}
+	}
+
+	// every originally-routed message and every retried message arrives once
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		mu.Lock()
+		count := len(delivered)
+		mu.Unlock()
+		if count >= len(wantRouted)+len(wantRetried) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for body := range wantRetried {
+		if delivered[body] != 1 {
+			t.Errorf("retried message %q delivered %d times, want 1", body, delivered[body])
+		}
+	}
+	for body := range wantRouted {
+		if delivered[body] != 1 {
+			t.Errorf("routed message %q delivered %d times, want 1", body, delivered[body])
+		}
+	}
+	if len(delivered) != len(wantRouted)+len(wantRetried) {
+		t.Errorf("consumer saw %d distinct bodies, want %d", len(delivered), len(wantRouted)+len(wantRetried))
 	}
 }
 
