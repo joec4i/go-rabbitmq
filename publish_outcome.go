@@ -83,6 +83,10 @@ type Outcome struct {
 	// message only within one channel generation; use ID for an identity that
 	// is stable across reconnects.
 	DeliveryTag uint64
+	// Ref is the value passed to WithPublishOptionsOutcomeRef, or nil. Every
+	// outcome of one PublishWithOutcome call carries the same ref, so use
+	// RoutingKey to tell them apart.
+	Ref any
 	// Ack is true when the broker took responsibility for the message. Note
 	// that the broker acks mandatory messages it could not route (after
 	// sending the return), so a routing failure is Ack=true with a non-nil
@@ -119,6 +123,13 @@ type PublishOutcome struct {
 // Done returns a channel that is closed when the outcome is available.
 func (p *PublishOutcome) Done() <-chan struct{} {
 	return p.done
+}
+
+// Ref returns the value passed to WithPublishOptionsOutcomeRef, or nil. It is
+// fixed when the message is published, so unlike the rest of the Outcome it is
+// readable at any time, including while the outcome is still unresolved.
+func (p *PublishOutcome) Ref() any {
+	return p.outcome.Ref
 }
 
 // Wait blocks until the outcome is available or the context is done.
@@ -486,7 +497,9 @@ func (t *outcomeTracker) nextID() string {
 //     Outcome.ID so a publisher outcome can be matched against the delivery.
 //   - Each Outcome carries the ID, Exchange and RoutingKey of its message, so
 //     the failed subset of a batch says where each message belongs without a
-//     side table.
+//     side table. Use WithPublishOptionsOutcomeRef to attach your own value
+//     and get it back as Outcome.Ref, rather than keeping a parallel index
+//     from outcomes to the data they came from.
 //   - When the channel is lost mid-flight, the outcome resolves with
 //     ErrOutcomeUnknown: the message may or may not have been delivered, so
 //     republishing can duplicate it.
@@ -575,6 +588,7 @@ func (publisher *Publisher) PublishWithOutcome(
 		po.outcome.Exchange = options.Exchange
 		po.outcome.RoutingKey = routingKey
 		po.outcome.DeliveryTag = conf.DeliveryTag
+		po.outcome.Ref = options.OutcomeRef
 		tracker.outstanding.Add(1)
 		go tracker.await(&outcomeEntry{id: id, gen: gen, uncertain: uncertain, dc: conf, po: po})
 		outcomes = append(outcomes, po)

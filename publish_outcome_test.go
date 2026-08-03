@@ -55,13 +55,19 @@ func newTestTracker(t *testing.T, maxInFlight int) (*outcomeTracker, chan amqp.R
 	}
 }
 
+// testRef stands in for a caller's own value attached with
+// WithPublishOptionsOutcomeRef. It is a distinct type from the library's id so
+// a test cannot pass by accidentally comparing the ref against Outcome.ID.
+type testRef struct{ name string }
+
 // submit registers one in-flight publishing with the tracker the same way
-// PublishWithOutcome does.
+// PublishWithOutcome does, including the identity fields.
 func submit(tracker *outcomeTracker, id string, dc deferredConfirmation) *PublishOutcome {
 	po := &PublishOutcome{done: make(chan struct{})}
 	po.outcome.ID = id
 	po.outcome.Exchange = "test-exchange"
 	po.outcome.RoutingKey = "test-key"
+	po.outcome.Ref = &testRef{name: id}
 	tracker.outstanding.Add(1)
 	go tracker.await(&outcomeEntry{id: id, gen: tracker.gen.Load(), dc: dc, po: po})
 	return po
@@ -176,6 +182,140 @@ func TestOutcomeReturnSurvivesChannelLoss(t *testing.T) {
 	if !errors.Is(outcome.Err, ErrOutcomeUnknown) || outcome.Return == nil {
 		t.Fatalf("expected unknown outcome with return attached, got %+v", outcome)
 	}
+}
+
+// TestOutcomeRefStaysOffTheWire: the ref is caller-side state, so unlike
+// CorrelationID it must not reach the broker in any form. buildPublishing
+// enumerates AMQP fields explicitly, and this pins that down so adding a
+// pass-through there cannot leak a caller's struct onto the wire.
+func TestOutcomeRefStaysOffTheWire(t *testing.T) {
+	secret := &testRef{name: "must-not-be-published"}
+	options := buildPublishOptions([]func(*PublishOptions){
+		WithPublishOptionsOutcomeRef(secret),
+		WithPublishOptionsHeaders(Table{"keep": "me"}),
+	})
+	if options.OutcomeRef != secret {
+		t.Fatal("WithPublishOptionsOutcomeRef did not set OutcomeRef")
+	}
+
+	message := buildPublishing(options, []byte("body"))
+	for key, value := range message.Headers {
+		if value == secret || value == any(secret) {
+			t.Errorf("header %q carries the outcome ref", key)
+		}
+	}
+	if _, ok := message.Headers["OutcomeRef"]; ok {
+		t.Error("OutcomeRef leaked into the message headers")
+	}
+	if message.CorrelationId != "" || message.MessageId != "" || message.AppId != "" {
+		t.Errorf("ref leaked into an AMQP property: %+v", message)
+	}
+	if got := message.Headers["keep"]; got != "me" {
+		t.Errorf("caller headers were not preserved: %v", got)
+	}
+}
+
+// TestOutcomeIdentitySurvivesEveryResolution asserts the identity half of an
+// Outcome is intact no matter which path resolved it. The tracker writes only
+// Ack, Return and Err, and this is the guard against a future rewrite that
+// assigns po.outcome wholesale and silently drops the caller's ref.
+func TestOutcomeIdentitySurvivesEveryResolution(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		resolve func(t *testing.T, tracker *outcomeTracker, returns chan amqp.Return, id string) *PublishOutcome
+	}{
+		{"acked", func(_ *testing.T, tracker *outcomeTracker, _ chan amqp.Return, id string) *PublishOutcome {
+			return submit(tracker, id, resolvedDC(true))
+		}},
+		{"returned and acked", func(_ *testing.T, tracker *outcomeTracker, returns chan amqp.Return, id string) *PublishOutcome {
+			returns <- brokerReturn(id)
+			return submit(tracker, id, resolvedDC(true))
+		}},
+		{"genuine nack", func(_ *testing.T, tracker *outcomeTracker, _ chan amqp.Return, id string) *PublishOutcome {
+			return submit(tracker, id, resolvedDC(false))
+		}},
+		{"channel loss", func(_ *testing.T, tracker *outcomeTracker, returns chan amqp.Return, id string) *PublishOutcome {
+			dc := &fakeDC{ack: false, done: make(chan struct{})}
+			po := submit(tracker, id, dc)
+			close(returns)
+			close(dc.done)
+			return po
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tracker, returns, stop := newTestTracker(t, 0)
+			defer stop()
+
+			id := t.Name()
+			outcome := waitOutcome(t, test.resolve(t, tracker, returns, id))
+			assertIdentity(t, outcome, id)
+		})
+	}
+
+	// abandon resolves entries whose completion can no longer reach the run
+	// goroutine, and it is the one path that does not go through resolve
+	t.Run("abandoned after tracker exit", func(t *testing.T) {
+		tracker, _, stop := newTestTracker(t, 0)
+		stop()
+
+		id := t.Name()
+		outcome := waitOutcome(t, submit(tracker, id, resolvedDC(true)))
+		assertIdentity(t, outcome, id)
+	})
+}
+
+func assertIdentity(t *testing.T, outcome Outcome, id string) {
+	t.Helper()
+	if outcome.ID != id {
+		t.Errorf("ID = %q, want %q", outcome.ID, id)
+	}
+	if outcome.Exchange != "test-exchange" {
+		t.Errorf("Exchange = %q, want %q", outcome.Exchange, "test-exchange")
+	}
+	if outcome.RoutingKey != "test-key" {
+		t.Errorf("RoutingKey = %q, want %q", outcome.RoutingKey, "test-key")
+	}
+	ref, ok := outcome.Ref.(*testRef)
+	if !ok {
+		t.Fatalf("Ref = %#v, want a *testRef", outcome.Ref)
+	}
+	if ref.name != id {
+		t.Errorf("Ref.name = %q, want %q", ref.name, id)
+	}
+}
+
+// TestOutcomeRefReadableWhileUnresolved is the executable form of the
+// disjointness argument: the ref is written before the tracker goroutine
+// starts and the tracker never touches it, so reading it concurrently with
+// resolution is not a race. Only meaningful under -race.
+func TestOutcomeRefReadableWhileUnresolved(t *testing.T) {
+	tracker, _, stop := newTestTracker(t, 0)
+	defer stop()
+
+	const messages = 50
+	var wg sync.WaitGroup
+	for i := range messages {
+		id := fmt.Sprintf("%s-%d", t.Name(), i)
+		dc := &fakeDC{ack: true, done: make(chan struct{})}
+		po := submit(tracker, id, dc)
+
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			// read the ref while the tracker is resolving the same outcome
+			for range 100 {
+				if ref := po.Ref().(*testRef); ref.name != id {
+					t.Errorf("Ref.name = %q, want %q", ref.name, id)
+					return
+				}
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			close(dc.done)
+		}()
+	}
+	wg.Wait()
 }
 
 func TestOutcomeFailed(t *testing.T) {
@@ -438,6 +578,7 @@ func TestOutcomeUncertainPublishResolvesConservatively(t *testing.T) {
 		po.outcome.ID = id
 		po.outcome.Exchange = "test-exchange"
 		po.outcome.RoutingKey = "test-key"
+		po.outcome.Ref = &testRef{name: id}
 		tracker.outstanding.Add(1)
 		go tracker.await(&outcomeEntry{
 			id: id, gen: tracker.gen.Load(), uncertain: true, dc: resolvedDC(true), po: po,
