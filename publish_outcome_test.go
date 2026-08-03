@@ -59,6 +59,8 @@ func newTestTracker(t *testing.T, maxInFlight int) (*outcomeTracker, chan amqp.R
 // PublishWithOutcome does.
 func submit(tracker *outcomeTracker, id string, dc deferredConfirmation) *PublishOutcome {
 	po := &PublishOutcome{done: make(chan struct{})}
+	po.outcome.ID = id
+	po.outcome.Exchange = "test-exchange"
 	po.outcome.RoutingKey = "test-key"
 	tracker.outstanding.Add(1)
 	go tracker.await(&outcomeEntry{id: id, gen: tracker.gen.Load(), dc: dc, po: po})
@@ -433,6 +435,9 @@ func TestOutcomeUncertainPublishResolvesConservatively(t *testing.T) {
 
 	submitUncertain := func(id string) *PublishOutcome {
 		po := &PublishOutcome{done: make(chan struct{})}
+		po.outcome.ID = id
+		po.outcome.Exchange = "test-exchange"
+		po.outcome.RoutingKey = "test-key"
 		tracker.outstanding.Add(1)
 		go tracker.await(&outcomeEntry{
 			id: id, gen: tracker.gen.Load(), uncertain: true, dc: resolvedDC(true), po: po,

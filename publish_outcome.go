@@ -56,10 +56,32 @@ var ErrPublisherClosed = errors.New("publisher is closed")
 const bufferedReturnsCount = 64
 
 // Outcome is the final fate of one message published with PublishWithOutcome.
+//
+// The fields fall into two groups. The identity group describes which message
+// this is; it is filled in before the message is published and is never
+// rewritten, so it is populated on every Outcome a caller can observe. The
+// remaining fields are the message's fate, written once when the outcome
+// resolves. Exchange and RoutingKey are what PublishWithOutcome needs to send
+// the message again, so a failed Outcome says where it belongs without a side
+// table from futures back to destinations.
 type Outcome struct {
+	// ID is the correlation identity assigned to this publishing and put on
+	// the wire as the OutcomeIDHeader header, so a publisher outcome can be
+	// matched against the consumer-side delivery. It is unique per publishing
+	// and stable across reconnects, unlike DeliveryTag. It is not a logical
+	// message identity: republishing a message assigns a new ID. For an
+	// identity that survives a retry, set your own with
+	// WithPublishOptionsMessageID.
+	ID string
+	// Exchange the message was published to. The empty string is the default
+	// exchange.
+	Exchange string
 	// RoutingKey the message was published with.
 	RoutingKey string
-	// DeliveryTag the channel assigned to the publishing.
+	// DeliveryTag the channel assigned to the publishing. Delivery tags are
+	// per-channel and restart at 1 after a reconnect, so a tag identifies a
+	// message only within one channel generation; use ID for an identity that
+	// is stable across reconnects.
 	DeliveryTag uint64
 	// Ack is true when the broker took responsibility for the message. Note
 	// that the broker acks mandatory messages it could not route (after
@@ -85,7 +107,12 @@ func (o Outcome) Failed() bool {
 // PublishOutcome resolves to the Outcome of one published message once the
 // broker has confirmed or returned it, or the channel is lost.
 type PublishOutcome struct {
-	done    chan struct{}
+	done chan struct{}
+	// outcome is written in two disjoint halves. PublishWithOutcome fills in
+	// the identity fields before the tracker goroutine is started and never
+	// writes them again; the tracker writes only Ack, Return and Err, then
+	// closes done. Because the halves are distinct fields, reading the
+	// identity before done is closed does not race with the tracker.
 	outcome Outcome
 }
 
@@ -412,7 +439,7 @@ func (t *outcomeTracker) await(entry *outcomeEntry) {
 // goroutine. Without the stash there is no way to tell whether the message
 // was returned, so the outcome is conservatively unknown.
 func (t *outcomeTracker) abandon(entry *outcomeEntry) {
-	t.logger.Warnf("publisher closed with outcome still in flight, resolving delivery tag %d as unknown", entry.po.outcome.DeliveryTag)
+	t.logger.Warnf("publisher closed with outcome still in flight, resolving %s as unknown", entry.id)
 	entry.po.outcome.Err = ErrOutcomeUnknown
 	close(entry.po.done)
 	t.release()
@@ -455,7 +482,11 @@ func (t *outcomeTracker) nextID() string {
 //   - Detecting unroutable messages requires WithPublishOptionsMandatory;
 //     without it the broker silently drops and still acks unroutable messages.
 //   - Every message is tagged with an OutcomeIDHeader header used for
-//     correlation; consumers of the message can see it.
+//     correlation; consumers of the message can see it, and it is reported as
+//     Outcome.ID so a publisher outcome can be matched against the delivery.
+//   - Each Outcome carries the ID, Exchange and RoutingKey of its message, so
+//     the failed subset of a batch says where each message belongs without a
+//     side table.
 //   - When the channel is lost mid-flight, the outcome resolves with
 //     ErrOutcomeUnknown: the message may or may not have been delivered, so
 //     republishing can duplicate it.
@@ -466,7 +497,9 @@ func (t *outcomeTracker) nextID() string {
 //     NotifyReturn on the same publisher delays outcome resolution (it cannot
 //     mis-pair outcomes, only delay them).
 //
-// On error, outcomes for routing keys already published are still returned
+// The returned outcomes are in routing-key order, so on error the key whose
+// publish failed is routingKeys[len(outcomes)] and the keys after it were never
+// sent. Outcomes for routing keys already published are still returned
 // alongside the error, since those messages were sent.
 func (publisher *Publisher) PublishWithOutcome(
 	ctx context.Context,
@@ -535,6 +568,11 @@ func (publisher *Publisher) PublishWithOutcome(
 		uncertain := tracker.chanManager.GetReconnectionCount() != listenerGen
 
 		po := &PublishOutcome{done: make(chan struct{})}
+		// the identity half of the outcome is written before the tracker
+		// goroutine exists, so it is readable while the outcome is unresolved
+		// and is enough to place the message on a retry
+		po.outcome.ID = id
+		po.outcome.Exchange = options.Exchange
 		po.outcome.RoutingKey = routingKey
 		po.outcome.DeliveryTag = conf.DeliveryTag
 		tracker.outstanding.Add(1)
