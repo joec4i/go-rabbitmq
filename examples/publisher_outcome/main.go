@@ -33,11 +33,23 @@ func deleteQueues(url string, names ...string) error {
 	return nil
 }
 
-// This example publishes a batch of messages and collects the ones that need
-// to be republished: nacked, returned as unroutable, or lost to a reconnect.
+// message is this example's own record of what it published. It is attached to
+// each publishing with WithPublishOptionsOutcomeRef and handed back on the
+// Outcome, which is what makes the retry loop below possible: an Outcome on its
+// own carries no payload unless the broker returned the message.
+type message struct {
+	id         int
+	body       []byte
+	routingKey string
+}
+
+// This example publishes a batch of messages and republishes the ones that
+// failed: nacked, returned as unroutable, or lost to a reconnect.
 // Confirmations and returns are paired per message by the library, so the
 // failed set is exact even with the whole batch in flight: expect the 50
 // messages aimed at no_such_queue to fail and the other 450 to be delivered.
+// Each failure identifies itself, so the retry needs no bookkeeping tying
+// outcomes back to payloads.
 func main() {
 	const url = "amqp://guest:guest@localhost"
 
@@ -92,17 +104,19 @@ func main() {
 
 	var outcomes []*rabbitmq.PublishOutcome
 	for i := range 500 {
-		routingKey := "my_queue"
+		msg := &message{id: i, body: []byte(fmt.Sprintf("message %d", i)), routingKey: "my_queue"}
 		if i%10 == 0 {
-			routingKey = "no_such_queue" // simulate unroutable messages
+			msg.routingKey = "no_such_queue" // simulate unroutable messages
 		}
 		batch, err := publisher.PublishWithOutcome(
 			ctx,
-			[]byte(fmt.Sprintf("message %d", i)),
-			[]string{routingKey},
+			msg.body,
+			[]string{msg.routingKey},
 			// mandatory is required for the broker to return unroutable
 			// messages instead of silently dropping them
 			rabbitmq.WithPublishOptionsMandatory,
+			// hands msg back on the outcome, so a failure knows what it was
+			rabbitmq.WithPublishOptionsOutcomeRef(msg),
 		)
 		if err != nil {
 			log.Fatalf("publish %d: %v", i, err)
@@ -110,6 +124,8 @@ func main() {
 		outcomes = append(outcomes, batch...)
 	}
 
+	// the failed outcomes can be collected and carried around on their own:
+	// each one still identifies its message
 	var failed []rabbitmq.Outcome
 	for _, po := range outcomes {
 		outcome, err := po.Wait(ctx)
@@ -122,16 +138,49 @@ func main() {
 	}
 
 	log.Printf("%d of %d messages need to be republished", len(failed), len(outcomes))
+
+	var retries []*rabbitmq.PublishOutcome
 	for _, outcome := range failed {
+		msg := outcome.Ref.(*message)
+		routingKey := msg.routingKey
 		switch {
 		case outcome.Err != nil:
 			// channel was lost mid-flight: the message may have been
-			// delivered, republish only if consumers deduplicate
-			log.Printf("outcome unknown for key %s (tag %d)", outcome.RoutingKey, outcome.DeliveryTag)
+			// delivered, so republishing it can duplicate it
+			log.Printf("message %d: outcome unknown (%s), republishing anyway", msg.id, outcome.ID)
 		case outcome.Return != nil:
-			log.Printf("unroutable: key %s, reply %s", outcome.Return.RoutingKey, outcome.Return.ReplyText)
+			// the same routing key would be unroutable again, so a real app
+			// would send it somewhere that exists or park it for inspection
+			log.Printf("message %d: unroutable (%s), rerouting to my_queue", msg.id, outcome.Return.ReplyText)
+			routingKey = "my_queue"
 		default:
-			log.Printf("nacked by broker: key %s (tag %d)", outcome.RoutingKey, outcome.DeliveryTag)
+			log.Printf("message %d: nacked by the broker, republishing", msg.id)
+		}
+
+		batch, err := publisher.PublishWithOutcome(
+			ctx,
+			msg.body,
+			[]string{routingKey},
+			rabbitmq.WithPublishOptionsExchange(outcome.Exchange),
+			rabbitmq.WithPublishOptionsMandatory,
+			rabbitmq.WithPublishOptionsOutcomeRef(msg),
+		)
+		if err != nil {
+			log.Fatalf("republish of message %d: %v", msg.id, err)
+		}
+		retries = append(retries, batch...)
+	}
+
+	stillFailed := 0
+	for _, po := range retries {
+		outcome, err := po.Wait(ctx)
+		if err != nil {
+			log.Fatalf("waiting for retry outcomes: %v", err)
+		}
+		if outcome.Failed() {
+			stillFailed++
+			log.Printf("message %d still failed after retry: %+v", outcome.Ref.(*message).id, outcome)
 		}
 	}
+	log.Printf("republished %d messages, %d still failed", len(retries), stillFailed)
 }

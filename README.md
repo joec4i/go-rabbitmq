@@ -131,8 +131,59 @@ for _, po := range outcomes {
 ```
 
 Use `WithPublisherOptionsMaxOutcomesInFlight` to bound memory by limiting how
-many outcomes may be unresolved at once. See
-[examples/publisher_outcome](examples/publisher_outcome) for a complete batch
+many outcomes may be unresolved at once.
+
+### Correlating outcomes with your data
+
+An `Outcome` reports `ID`, `Exchange`, `RoutingKey` and `DeliveryTag`, but not
+the payload — only a message the broker returned as unroutable carries its body
+back, on `Return.Body`. To act on a failure you usually need your own record of
+it, so attach one with `WithPublishOptionsOutcomeRef` and read it back from
+`Outcome.Ref`:
+
+```go
+outcomes, err := publisher.PublishWithOutcome(
+	ctx,
+	row.Body,
+	[]string{row.RoutingKey},
+	rabbitmq.WithPublishOptionsMandatory,
+	rabbitmq.WithPublishOptionsOutcomeRef(row), // your value, echoed back
+)
+if err != nil {
+	log.Println(err)
+}
+for _, po := range outcomes {
+	outcome, err := po.Wait(ctx)
+	if err != nil {
+		log.Println(err)
+	}
+	if outcome.Failed() {
+		row := outcome.Ref.(*Row) // republish it, or mark it in your database
+		log.Printf("row %d failed: %v", row.ID, outcome.Err)
+	}
+}
+```
+
+The ref is opaque to the library and is never sent to the broker — unlike
+`CorrelationID`, which is an AMQP property your consumers can see. It is held
+only until the outcome resolves, so `WithPublisherOptionsMaxOutcomesInFlight`
+bounds how much it can retain. Every outcome of one call carries the same ref;
+use `RoutingKey` to tell them apart, and `PublishOutcome.Ref` to read it before
+the outcome resolves.
+
+A few other things worth knowing:
+
+- `Outcome.ID` is the value the library puts on the wire as the
+  `x-gorabbitmq-outcome-id` header, so you can match a publisher outcome against
+  the delivery your consumer received. Prefer it over `DeliveryTag`, which is
+  per-channel and restarts at 1 after a reconnect.
+- If you would rather keep the correlation statically typed, `*PublishOutcome` is
+  a unique handle and works as a map key: `map[*PublishOutcome]*Row`.
+- When `Wait` returns a context error the message is still in flight. The
+  returned `Outcome` carries the identity and ref anyway, with `Err` set to the
+  context error, so you can record which message you stopped waiting on.
+
+See [examples/publisher_outcome](examples/publisher_outcome) for a complete batch
 publish-and-retry example.
 
 ## Other usage examples
